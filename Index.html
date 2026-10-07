@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="lt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Skystojo stiklo slankiklis</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fredoka:wght@600&display=swap">
+<style>
+  :root {
+    color-scheme: light;
+    --page: #E9EBEC;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  html, body { margin: 0; height: 100%; background: var(--page); overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #slider {
+    position: fixed; inset: 0; outline: none;
+    touch-action: none; -webkit-tap-highlight-color: transparent; cursor: default;
+  }
+  /* the visible word is rendered as glass in WebGL; this copy names the slider for screen readers */
+  #label {
+    position: fixed; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden;
+    clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0;
+  }
+  #slider.grab { cursor: grab; }
+  #slider.dragging { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<p id="label">Pilnumas</p>
+<div id="slider" role="slider" tabindex="0" aria-labelledby="label" aria-orientation="horizontal"
+     aria-valuemin="0" aria-valuemax="100" aria-valuenow="53" aria-valuetext="53 %"></div>
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * CONFIG — every tunable lives here.
+ * Scene unit: 1.0 = lens width / 0.9 (so the lens is always 0.90 wide,
+ * 0.64 tall, like the reference). The layout scales the unit to the
+ * viewport so the whole slider, both track ends and the number fit.
+ * ------------------------------------------------------------------ */
+const CONFIG = {
+  colors: {
+    bgDark:    "#E4E6E8",
+    bgLight:   "#F1F2F3",
+    track:     "#ECEDEE",
+    fillStart: "#0A5FD8",
+    fillEnd:   "#1E93E6",
+    glassTint: "#C9D1D9",
+    numberTint:"#3E9CF0",   // colour of the glass the digits are made of
+    focus:     "#1E7BE0"
+  },
+  layout: {
+    lensOfViewportWidth: 0.34,   // lens width as share of viewport width
+    lensMinPx: 120, lensMaxPx: 470,
+    fitHeight: 0.80,             // number + lens may use this share of viewport height
+    sidePad: 0.06,               // free space beyond the lens at both track ends (units)
+    labelCap: 0.15,              // "PILNUMAS" cap height (units)
+    labelGap: 0.12,              // label bottom → digits top (units)
+    numberCap: 0.40,             // digit height (units)
+    numberGap: 0.14,             // digits bottom → lens top (units)
+    lift: 0.03                   // shift the group up a little to balance the shadow
+  },
+  track: { height: 0.15, innerShadow: 0.05, yOffset: 0.01 },
+  fill:  { gloss: 0.10 },
+  lens: {
+    width: 0.90, height: 0.64,
+    exponent: 2.9, bevel: 0.12, ior: 1.45, depth: 0.21, dispersion: 0.03,
+    tint: 0.03, fresnelF0: 0.04,
+    rimSpecular: 0.9, topSpecular: 0.35, lowerSpecular: 0.22, innerShade: 0.06,
+    rimStreak: 0.85, rimStreakReach: 0.16
+  },
+  shadow: { offsetX: 0.014, offsetY: 0.034, blur: 0.09, opacity: 0.07, caustic: 0.035 },
+  number: {
+    family: 'Fredoka, "Varela Round", "Arial Rounded MT Bold", ui-rounded, "Nunito", system-ui, sans-serif',
+    weight: 600,
+    atlasFontPx: 240,
+    tracking: 0.90,          // digit advance multiplier (tabular slots)
+    percentScale: 0.62,      // "%" size relative to digits
+    percentGap: 0.16,        // space before "%" as share of a digit advance
+    bevel: 0.042, depth: 0.05, ior: 1.5, dispersion: 0.04,
+    density: 2.1,            // how deep the blue gets in the thick middle of a stroke
+    rimSpecular: 0.75,
+    morph: 0.16,             // seconds for one digit to melt into the next
+    shadow: { offsetX: 0.008, offsetY: 0.022, blur: 0.05, opacity: 0.12, caustic: 0.025 }
+  },
+  label: {
+    text: "PILNUMAS",
+    atlasFontPx: 180,
+    tracking: 0.14,          // letter spacing, em
+    bevel: 0.017, depth: 0.04, ior: 1.5, dispersion: 0.04,
+    frost: 0.30,             // milky white of the empty glass
+    density: 2.1,            // how deep the blue liquid gets in thick parts
+    rimSpecular: 0.8,
+    meniscus: 0.45,          // bright line on the liquid surface
+    margin: 0.07,            // level at 0 % / 100 % sits this far (× cap) beyond the letters
+    slosh: { gain: 0.055, max: 0.09, freq: 1.3, damping: 0.32 },
+    wave:  { amp: 0.05, k: 38.0, speed: 4.2 },   // amp × cap height
+    shadow: { offsetX: 0.006, offsetY: 0.014, blur: 0.032, opacity: 0.10, caustic: 0.02 }
+  },
+  spring: {
+    fill:    { freq: 3.2, damping: 1.0 },
+    lens:    { freq: 1.9, damping: 0.78 },
+    stretch: { freq: 2.4, damping: 0.42 },
+    digits:  { freq: 3.5, damping: 1.0 }
+  },
+  stretch: { max: 0.04, gain: 0.05 },
+  autoplay: { enabled: true, min: 0.25, max: 0.80, move: 2.5, hold: 1.2, resumeDelay: 3.0 },
+  value: { initial: 0.53, step: 0.01, pageStep: 0.10 },
+  maxDPR: 2,
+  dither: 1.6 / 255
+};
+
+/* ------------------------------------------------------------------ */
+const canvas = document.getElementById("gl");
+const sliderEl = document.getElementById("slider");
+const gl = canvas.getContext("webgl2", { antialias: false, alpha: false });
+const hex = h => { const n = parseInt(h.slice(1), 16); return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255]; };
+
+const VS = `#version 300 es
+void main(){
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+out vec4 outColor;
+
+uniform vec2  uRes, uView;
+uniform float uUnit;
+uniform vec3  uTrackGeo;                  // centre-line ends xL, xR and y
+uniform float uTrackHalf, uTrackShadow, uGloss, uFill;
+uniform vec2  uLensC, uLensHalf;
+uniform float uExp, uBevel, uIor, uDepth, uDisp, uTint, uF0;
+uniform float uRimSpec, uTopSpec, uLowSpec, uInnerShade, uStreak, uStreakReach;
+uniform vec3  uBgDark, uBgLight, uTrackCol, uFillA, uFillB, uTintCol, uFocusCol, uNumTint;
+uniform vec2  uShadowOff;
+uniform float uShadowBlur, uShadowOpacity, uCaustic;
+uniform sampler2D uAtlas;
+uniform vec2  uAtlasSize, uCell;
+uniform float uCols, uSpread, uTextScale, uTextY;
+uniform vec4  uSlot[4];                   // glyph from, glyph to, morph 0..1, centre x
+uniform float uNumBevel, uNumDepth, uNumIor, uNumDisp, uNumDensity, uNumRimSpec;
+uniform vec2  uNumShadowOff;
+uniform float uNumShadowBlur, uNumShadowOpacity, uNumCaustic;
+uniform float uDither, uFocus;
+uniform sampler2D uLabel;
+uniform vec2  uLabelSize, uLabelC, uLabelShadowOff;
+uniform float uLabelOn, uLabelScale, uLabelSpread, uLabelBevel, uLabelDepth, uLabelIor, uLabelDisp;
+uniform float uLabelFrost, uLabelDensity, uLabelRim, uMeniscus;
+uniform float uLevelY, uLevelTilt, uWaveAmp, uWaveK, uWaveW, uTime;
+uniform float uLabelShadowBlur, uLabelShadowOpacity, uLabelCaustic;
+
+float squircle(vec2 p, vec2 ab, float n, out vec2 g){
+  vec2 sg = vec2(p.x < 0.0 ? -1.0 : 1.0, p.y < 0.0 ? -1.0 : 1.0);
+  vec2 q  = abs(p) / ab + 1e-5;
+  vec2 q1 = pow(q, vec2(n - 1.0));
+  float S = q1.x * q.x + q1.y * q.y;
+  float F = pow(S, 1.0 / n);
+  vec2 grad = pow(S, 1.0 / n - 1.0) * q1 / ab * sg;
+  float gl = max(length(grad), 1e-4);
+  g = grad / gl;
+  return (F - 1.0) / gl;
+}
+
+/* ---- digits: SDF atlas, one tabular slot per character ---- */
+float glyphD(float gi, vec2 lp){
+  if (gi < -0.5) return uSpread;
+  vec2 c = clamp(lp + 0.5 * uCell, vec2(1.0), uCell - 1.0);
+  vec2 cell = vec2(mod(gi, uCols), floor(gi / uCols + 1e-3));
+  return textureLod(uAtlas, (cell * uCell + c) / uAtlasSize, 0.0).r;
+}
+float slotD(int i, vec2 q){
+  vec2 lp0 = (q - vec2(0.0, uTextY)) / uTextScale;
+  if (abs(lp0.y) > 0.5 * uCell.y) return uSpread * uTextScale;
+  vec4 s = uSlot[i];
+  vec2 lp = vec2((q.x - s.w) / uTextScale, lp0.y);
+  if (abs(lp.x) > 0.5 * uCell.x) return uSpread * uTextScale;
+  float b = glyphD(s.y, lp);
+  float a = s.z < 0.999 ? glyphD(s.x, lp) : b;
+  return mix(a, b, s.z) * uTextScale;
+}
+float textD(vec2 q, out int idx){
+  float d = 1e3; idx = 0;
+  for (int i = 0; i < 4; i++) { float di = slotD(i, q); if (di < d) { d = di; idx = i; } }
+  return d;
+}
+vec2 textGrad(int i, vec2 q){
+  float e = 2.5 * uTextScale;   // wide stencil = smooth normals
+  vec2 g = vec2(slotD(i, q + vec2(e, 0.0)) - slotD(i, q - vec2(e, 0.0)),
+                slotD(i, q + vec2(0.0, e)) - slotD(i, q - vec2(0.0, e)));
+  float l = length(g);
+  return l > 1e-7 ? g / l : vec2(0.0, -1.0);
+}
+
+/* ---- label: one SDF texture for the whole word ---- */
+float labelD(vec2 q){
+  if (uLabelOn < 0.5) return 1e3;
+  vec2 lp = (q - uLabelC) / uLabelScale + 0.5 * uLabelSize;
+  vec2 o = abs(lp - 0.5 * uLabelSize) - 0.5 * uLabelSize;
+  if (max(o.x, o.y) > 2.0) return (uLabelSpread + length(max(o, 0.0))) * uLabelScale;
+  vec2 c = clamp(lp, vec2(1.0), uLabelSize - 1.0);
+  return (textureLod(uLabel, c / uLabelSize, 0.0).r + length(lp - c)) * uLabelScale;
+}
+vec2 labelGrad(vec2 q){
+  float e = 2.0 * uLabelScale;
+  vec2 g = vec2(labelD(q + vec2(e, 0.0)) - labelD(q - vec2(e, 0.0)),
+                labelD(q + vec2(0.0, e)) - labelD(q - vec2(0.0, e)));
+  float l = length(g);
+  return l > 1e-7 ? g / l : vec2(0.0, -1.0);
+}
+// liquid surface height (y grows downwards) at x
+float liquidY(float x){
+  float w = sin(x * uWaveK + uTime * uWaveW) * 0.6 + sin(x * uWaveK * 1.73 - uTime * uWaveW * 1.31) * 0.4;
+  return uLevelY + (x - uLabelC.x) * uLevelTilt + uWaveAmp * w;
+}
+
+vec3 background(vec2 q){
+  vec2 vn = q / uView;
+  float t = clamp(0.5 + 0.62 * (vn.x - vn.y), 0.0, 1.0);
+  vec3 c = mix(uBgDark, uBgLight, smoothstep(0.0, 1.0, t));
+  vec2 lp = vn - vec2(0.95, -0.05);
+  c += 0.008 * exp(-dot(lp, lp) * 2.2);
+  return c;
+}
+
+vec3 scene(vec2 q, float aa){
+  vec3 col = background(q);
+  float r  = uTrackHalf;
+  float dy = q.y - uTrackGeo.z;
+
+  // track: capsule with visible rounded ends, shallow recessed groove
+  vec2  tv = q - vec2(clamp(q.x, uTrackGeo.x, uTrackGeo.y), uTrackGeo.z);
+  float dT = length(tv) - r;
+  float inT = 1.0 - smoothstep(-aa, aa, dT);
+  float depthIn = max(-dT, 0.0);
+  float topW = clamp(0.5 - 0.6 * tv.y / r, 0.0, 1.0);
+  vec3 tcol = uTrackCol * (1.0 - uTrackShadow * exp(-depthIn / 0.011) * topW);
+  tcol += 0.010 * exp(-depthIn / 0.008) * (1.0 - topW);
+  col = mix(col, tcol, inT);
+
+  // fill: the track clipped at the fill end, with a pill-shaped right end
+  float dx = q.x - (uFill - r);
+  float dP = dx > 0.0 ? length(vec2(dx, dy)) - r : abs(dy) - r;
+  float dF = max(dT, dP);
+  float x0 = uTrackGeo.x - r;
+  // at 0 % the track is truly empty: the end cap melts in over the first percent
+  float inF = (1.0 - smoothstep(-aa, aa, dF)) * smoothstep(r + 0.002, r + 0.025, uFill - x0);
+  float gx = clamp((q.x - x0) / max(uFill - x0, 1e-3), 0.0, 1.0);
+  vec3 fcol = mix(uFillA, uFillB, smoothstep(0.0, 1.0, gx));
+  fcol += uGloss * exp(-max(dy + r, 0.0) / 0.016);
+  fcol *= 1.0 - 0.06 * smoothstep(0.2, 1.0, dy / r);
+  col = mix(col, fcol, inF);
+
+  // lens contact shadow + caustic
+  vec2 sgN;
+  float ds = squircle(q - uLensC - uShadowOff, uLensHalf, uExp, sgN);
+  float outer = 1.0 - smoothstep(-0.02, uShadowBlur, ds);
+  float inner = mix(0.30, 1.0, smoothstep(-0.20, -0.01, ds));
+  col *= 1.0 - uShadowOpacity * outer * inner;
+  col += uCaustic * exp(-pow((ds + 0.04) / 0.028, 2.0)) * (0.45 + 0.55 * max(dot(sgN, normalize(vec2(0.55, 0.85))), 0.0));
+
+  // digit shadow: blue glass casts a slightly blue shadow and a focused caustic
+  int si;
+  float dts = textD(q - uNumShadowOff, si);
+  float tsh = (1.0 - smoothstep(-0.004, uNumShadowBlur, dts)) * mix(0.5, 1.0, smoothstep(-0.03, 0.0, dts));
+  col *= 1.0 - uNumShadowOpacity * tsh * vec3(1.0, 0.80, 0.55);
+  col += uNumCaustic * exp(-pow((dts + 0.012) / 0.010, 2.0)) * vec3(0.55, 0.82, 1.0);
+
+  // label shadow: clear where empty, blue-tinted where the liquid is
+  if (uLabelOn > 0.5) {
+    vec2 qs = q - uLabelShadowOff;
+    float dls = labelD(qs);
+    if (dls < uLabelShadowBlur + 0.01) {
+      float lsh = (1.0 - smoothstep(-0.003, uLabelShadowBlur, dls)) * mix(0.45, 1.0, smoothstep(-0.02, 0.0, dls));
+      float wetS = smoothstep(-0.004, 0.004, qs.y - liquidY(qs.x));
+      col *= 1.0 - uLabelShadowOpacity * lsh * mix(vec3(0.85), vec3(1.0, 0.78, 0.52), wetS);
+      col += uLabelCaustic * exp(-pow((dls + 0.006) / 0.006, 2.0)) * mix(vec3(1.0), vec3(0.55, 0.82, 1.0), wetS);
+    }
+  }
+  return col;
+}
+
+vec2 refrOffset(vec3 n, float ior, float thick){
+  vec3 r = refract(vec3(0.0, 0.0, -1.0), n, 1.0 / ior);
+  return r.xy / max(-r.z, 0.22) * thick;
+}
+
+struct Glass { vec3 n; float t, u, zb; vec2 oR, oG, oB; float aR, aG, aB; };
+Glass makeGlass(vec2 q, float d, vec2 g, float bevel, float depth, float ior, float disp, float px){
+  Glass s;
+  s.t  = max(-d, 0.0);
+  s.u  = clamp(1.0 - s.t / bevel, 0.0, 1.0);
+  s.zb = sqrt(max(1.0 - s.u * s.u, 0.0));
+  s.n  = normalize(vec3(g * s.u, max(s.zb, 0.03)));
+  float th = depth + bevel * s.zb;
+  s.oG = refrOffset(s.n, ior, th);
+  s.oR = refrOffset(s.n, ior - disp * 0.5, th);
+  s.oB = refrOffset(s.n, ior + disp * 0.5, th);
+  s.aR = clamp(length(fwidth(q + s.oR)), 0.75 * px, 0.035);
+  s.aG = clamp(length(fwidth(q + s.oG)), 0.75 * px, 0.035);
+  s.aB = clamp(length(fwidth(q + s.oB)), 0.75 * px, 0.035);
+  return s;
+}
+vec3 refracted(vec2 q, Glass s){
+  return vec3(scene(q + s.oR, s.aR).r, scene(q + s.oG, s.aG).g, scene(q + s.oB, s.aB).b);
+}
+vec3 withFresnel(Glass s, vec3 tr){
+  vec3 R = reflect(vec3(0.0, 0.0, -1.0), s.n);
+  float F = uF0 + (1.0 - uF0) * pow(1.0 - s.n.z, 5.0);
+  vec3 env = mix(vec3(0.875, 0.885, 0.895), vec3(0.985), smoothstep(-0.3, 0.7, R.z));
+  env += 0.06 * smoothstep(0.80, 0.98, dot(R, normalize(vec3(-0.45, -0.55, 0.70))));
+  return mix(tr, env, F);
+}
+// x: top gleam, y: lower-right broad highlight, z: crisp rim line
+vec3 highlights(Glass s, vec2 g, float px, float rimOff, float rimW){
+  vec3 L1 = normalize(vec3(-0.40, -0.80, 0.45));
+  vec3 L2 = normalize(vec3( 0.60,  0.70, 0.40));
+  float s1 = pow(max(dot(s.n, normalize(L1 + vec3(0, 0, 1))), 0.0), 140.0);
+  float s2 = pow(max(dot(s.n, normalize(L2 + vec3(0, 0, 1))), 0.0), 16.0);
+  float facing = smoothstep(-0.15, 0.85, dot(g, normalize(vec2(-0.42, -1.0))));
+  float lw = max(rimW, px);
+  float rim = exp(-pow((s.t - rimOff) / lw, 2.0)) * (0.07 + 0.93 * facing);
+  return vec3(s1, s2, rim);
+}
+
+float ign(vec2 p){ return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+
+void main(){
+  vec2 fc = gl_FragCoord.xy;
+  vec2 q  = vec2(fc.x, uRes.y - fc.y) / uUnit;
+  float px = 1.0 / uUnit;
+
+  // lens (all derivative work happens in uniform control flow)
+  vec2 g;
+  float d  = squircle(q - uLensC, uLensHalf, uExp, g);
+  float fw = max(fwidth(d), 0.5 * px);
+  float cover = clamp(0.5 - d / fw, 0.0, 1.0);
+  Glass L = makeGlass(q, d, g, uBevel, uDepth, uIor, uDisp, px);
+
+  // number
+  int ti;
+  float dn  = textD(q, ti);
+  vec2  gn  = textGrad(ti, q);
+  float fwn = max(fwidth(dn), 0.5 * px);
+  float coverN = clamp(0.5 - dn / fwn, 0.0, 1.0);
+  Glass N = makeGlass(q, dn, gn, uNumBevel, uNumDepth, uNumIor, uNumDisp, px);
+
+  // label
+  float dl  = labelD(q);
+  vec2  glb = labelGrad(q);
+  float fwl = max(fwidth(dl), 0.5 * px);
+  float coverL = uLabelOn > 0.5 ? clamp(0.5 - dl / fwl, 0.0, 1.0) : 0.0;
+  Glass B = makeGlass(q, dl, glb, uLabelBevel, uLabelDepth, uLabelIor, uLabelDisp, px);
+
+  vec3 col = scene(q, 0.75 * px);
+
+  if (coverL > 0.0) {
+    vec3 tr = refracted(q, B);
+    float ys  = liquidY(q.x);
+    float wet = smoothstep(-px, px, q.y - ys);
+    vec3 dry = mix(tr, vec3(1.0), uLabelFrost * (0.45 + 0.55 * B.zb));            // empty: milky white glass
+    vec3 liq = tr * pow(uNumTint, vec3(uLabelDensity * (0.30 + 0.70 * B.zb)));    // full: blue liquid
+    liq += vec3(0.06, 0.16, 0.22) * exp(-max(q.y - ys, 0.0) / 0.012);             // light just under the surface
+    vec3 body = mix(dry, liq, wet);
+    float men = exp(-pow((q.y - ys) / (1.4 * px), 2.0));
+    body += uMeniscus * men * (0.35 + 0.65 * B.zb) * vec3(0.65, 0.88, 1.0);
+    vec3 glass = withFresnel(B, body);
+    vec3 h = highlights(B, glb, px, 0.0016, 0.0010);
+    glass += vec3(0.45 * h.x + 0.25 * h.y + uLabelRim * h.z);
+    col = mix(col, glass, coverL);
+  }
+
+  if (coverN > 0.0) {
+    vec3 tr = refracted(q, N);
+    tr *= pow(uNumTint, vec3(uNumDensity * (0.25 + 0.75 * N.zb)));   // thicker = deeper blue
+    vec3 glass = withFresnel(N, tr);
+    vec3 h = highlights(N, gn, px, 0.0022, 0.0013);
+    glass += vec3(0.45 * h.x + 0.25 * h.y + uNumRimSpec * h.z);
+    col = mix(col, glass, coverN);
+  }
+
+  if (cover > 0.0) {
+    vec3 tr = refracted(q, L);
+    tr = mix(tr, uTintCol, uTint);
+    float band = smoothstep(0.12, 0.45, L.u) * (1.0 - smoothstep(0.55, 0.92, L.u));
+    tr *= 1.0 - uInnerShade * band;
+    vec3 glass = withFresnel(L, tr);
+
+    // light-guide streak: the bevel wall carries the fill colour up and down the rim
+    float reach = exp(-max(abs(q.y - uTrackGeo.z) - uTrackHalf, 0.0) / uStreakReach);
+    float tubeW = 0.0035 + 0.011 * reach * reach;
+    float tubeMask = exp(-pow((L.t - 0.5 * tubeW - 0.003) / tubeW, 2.0));
+    float sideFacing = smoothstep(0.35, 0.85, abs(g.x));
+    vec3 pipe = scene(vec2(q.x - g.x * 0.02, uTrackGeo.z), 0.01);
+    float blueness = clamp((pipe.b - pipe.r) * 1.6, 0.0, 1.0);
+    vec3 pipeTint = mix(pipe, pipe + vec3(0.02, 0.10, 0.07), smoothstep(0.0, 0.8, g.y));
+    float streakW = uStreak * tubeMask * reach * blueness * sideFacing;
+    glass = mix(glass, pipeTint, streakW);
+
+    vec3 h = highlights(L, g, px, 0.0032, 0.0016);
+    glass += vec3(uTopSpec * h.x + uLowSpec * h.y + uRimSpec * h.z * (1.0 - 0.7 * streakW));
+    col = mix(col, glass, cover);
+  }
+
+  if (uFocus > 0.0) {
+    float ring = 1.0 - smoothstep(0.0025, 0.0025 + 1.5 * fw, abs(d - 0.012));
+    col = mix(col, uFocusCol, 0.75 * ring * uFocus);
+  }
+
+  col += (ign(fc) + ign(fc + vec2(23.0, 71.0)) - 1.0) * uDither;
+  outColor = vec4(col, 1.0);
+}`;
+
+/* ---- GL setup ------------------------------------------------------ */
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+let prog, U = {};
+function initGL(){
+  prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  gl.bindVertexArray(gl.createVertexArray());
+  U = {};
+  const n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const a = gl.getActiveUniform(prog, i); U[a.name] = gl.getUniformLocation(prog, a.name); }
+  setStaticUniforms();
+  atlas.tex = null; labelTex.tex = null;
+  if (atlas.data) uploadAtlas();
+  uploadLabel();
+}
+function setStaticUniforms(){
+  const C = CONFIG, L = C.lens, c = C.colors, N = C.number;
+  const v3 = (n, h) => gl.uniform3fv(U[n], hex(h)), f = (n, x) => gl.uniform1f(U[n], x);
+  v3("uBgDark", c.bgDark); v3("uBgLight", c.bgLight); v3("uTrackCol", c.track);
+  v3("uFillA", c.fillStart); v3("uFillB", c.fillEnd); v3("uTintCol", c.glassTint);
+  v3("uFocusCol", c.focus); v3("uNumTint", c.numberTint);
+  f("uTrackHalf", C.track.height / 2); f("uTrackShadow", C.track.innerShadow); f("uGloss", C.fill.gloss);
+  f("uExp", L.exponent); f("uBevel", L.bevel * L.height); f("uIor", L.ior); f("uDepth", L.depth);
+  f("uDisp", L.dispersion); f("uTint", L.tint); f("uF0", L.fresnelF0);
+  f("uRimSpec", L.rimSpecular); f("uTopSpec", L.topSpecular); f("uLowSpec", L.lowerSpecular);
+  f("uInnerShade", L.innerShade); f("uStreak", L.rimStreak); f("uStreakReach", L.rimStreakReach);
+  gl.uniform2f(U.uShadowOff, C.shadow.offsetX, C.shadow.offsetY);
+  f("uShadowBlur", C.shadow.blur); f("uShadowOpacity", C.shadow.opacity); f("uCaustic", C.shadow.caustic);
+  f("uNumBevel", N.bevel); f("uNumDepth", N.depth); f("uNumIor", N.ior); f("uNumDisp", N.dispersion);
+  f("uNumDensity", N.density); f("uNumRimSpec", N.rimSpecular);
+  gl.uniform2f(U.uNumShadowOff, N.shadow.offsetX, N.shadow.offsetY);
+  f("uNumShadowBlur", N.shadow.blur); f("uNumShadowOpacity", N.shadow.opacity); f("uNumCaustic", N.shadow.caustic);
+  f("uDither", C.dither);
+  const B = C.label;
+  f("uLabelBevel", B.bevel); f("uLabelDepth", B.depth); f("uLabelIor", B.ior); f("uLabelDisp", B.dispersion);
+  f("uLabelFrost", B.frost); f("uLabelDensity", B.density); f("uLabelRim", B.rimSpecular); f("uMeniscus", B.meniscus);
+  gl.uniform2f(U.uLabelShadowOff, B.shadow.offsetX, B.shadow.offsetY);
+  f("uLabelShadowBlur", B.shadow.blur); f("uLabelShadowOpacity", B.shadow.opacity); f("uLabelCaustic", B.shadow.caustic);
+  f("uLabelOn", 0);
+}
+
+/* ---- digit atlas: canvas text → signed distance field (EDT) ------- */
+const atlas = { cellW: 300, cellH: 340, cols: 6, rows: 2, spread: 52, w: 0, h: 0,
+                capPx: 168, digitAdv: 150, pctAdv: 120, data: null, tex: null };
+
+function edt1d(grid, offset, stride, length, f, v, z){
+  v[0] = 0; z[0] = -1e20; z[1] = 1e20; f[0] = grid[offset];
+  for (let q = 1, k = 0, s = 0; q < length; q++) {
+    f[q] = grid[offset + q * stride];
+    const q2 = q * q;
+    do { const r = v[k]; s = (f[q] - f[r] + q2 - r * r) / (q - r) / 2; } while (s <= z[k] && --k > -1);
+    k++; v[k] = q; z[k] = s; z[k + 1] = 1e20;
+  }
+  for (let q = 0, k = 0; q < length; q++) {
+    while (z[k + 1] < q) k++;
+    const r = v[k], qr = q - r;
+    grid[offset + q * stride] = f[r] + qr * qr;
+  }
+}
+function edt(grid, w, h, f, v, z){
+  for (let x = 0; x < w; x++) edt1d(grid, x, w, h, f, v, z);
+  for (let y = 0; y < h; y++) edt1d(grid, y * w, 1, w, f, v, z);
+}
+function buildAtlas(){
+  const N = CONFIG.number, fpx = N.atlasFontPx;
+  const font = px => `${N.weight} ${px}px ${N.family}`;
+  const w = atlas.cellW * atlas.cols, h = atlas.cellH * atlas.rows;
+  const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+  const cx = cv.getContext("2d", { willReadFrequently: true });
+  cx.font = font(fpx);
+  const cap = cx.measureText("0").actualBoundingBoxAscent || fpx * 0.7;
+  let adv = 0; for (const ch of "0123456789") adv = Math.max(adv, cx.measureText(ch).width);
+  const pctPx = fpx * N.percentScale;
+  cx.font = font(pctPx);
+  const pAdv = cx.measureText("%").width;
+  cx.textAlign = "center"; cx.textBaseline = "alphabetic"; cx.fillStyle = "#fff";
+  const chars = "0123456789%";
+  for (let i = 0; i < chars.length; i++) {
+    const col = i % atlas.cols, row = Math.floor(i / atlas.cols);
+    cx.font = font(i < 10 ? fpx : pctPx);
+    cx.fillText(chars[i], col * atlas.cellW + atlas.cellW / 2, row * atlas.cellH + atlas.cellH / 2 + cap / 2);
+  }
+  const out = sdfField(cx, w, h, atlas.spread);
+  Object.assign(atlas, { w, h, capPx: cap, digitAdv: adv, pctAdv: pAdv, data: out });
+}
+// canvas alpha → signed distance field (px), clamped to ±S
+function sdfField(cx, w, h, S){
+  const px = cx.getImageData(0, 0, w, h).data, n = w * h, INF = 1e20;
+  const outer = new Float64Array(n), inner = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const a = px[i * 4 + 3] / 255;
+    if (a >= 1) { outer[i] = 0; inner[i] = INF; }
+    else if (a <= 0) { outer[i] = INF; inner[i] = 0; }
+    else { const d = 0.5 - a; outer[i] = d > 0 ? d * d : 0; inner[i] = d < 0 ? d * d : 0; }
+  }
+  const L = Math.max(w, h), f = new Float64Array(L), v = new Uint16Array(L), z = new Float64Array(L + 1);
+  edt(outer, w, h, f, v, z); edt(inner, w, h, f, v, z);
+  let out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = Math.sqrt(outer[i]) - Math.sqrt(inner[i]);
+  // Two separable [1 2 1] passes remove the faint ripple the anti-aliased edge leaves in the field.
+  const tmp = new Float32Array(n);
+  for (let pass = 0; pass < 2; pass++) {
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x, l = x > 0 ? i - 1 : i, r = x < w - 1 ? i + 1 : i;
+      tmp[i] = (out[l] + 2 * out[i] + out[r]) * 0.25;
+    }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x, u = y > 0 ? i - w : i, d = y < h - 1 ? i + w : i;
+      out[i] = (tmp[u] + 2 * tmp[i] + tmp[d]) * 0.25;
+    }
+  }
+  for (let i = 0; i < n; i++) out[i] = Math.max(-S, Math.min(S, out[i]));
+  return out;
+}
+
+const labelTex = { spread: 36, w: 0, h: 0, capPx: 1, data: null, tex: null };
+function buildLabel(){
+  const B = CONFIG.label, N = CONFIG.number, fpx = B.atlasFontPx, S = labelTex.spread;
+  const font = `${N.weight} ${fpx}px ${N.family}`;
+  const m = document.createElement("canvas").getContext("2d");
+  m.font = font;
+  const chars = [...B.text], track = B.tracking * fpx;
+  const advs = chars.map(c => m.measureText(c).width);
+  const textW = advs.reduce((a, b) => a + b, 0) + track * (chars.length - 1);
+  const mt = m.measureText(B.text);
+  const cap = mt.actualBoundingBoxAscent || fpx * 0.7;
+  const desc = Math.max(mt.actualBoundingBoxDescent || 0, cap * 0.04);
+  const w = Math.ceil(textW + 2 * S + 8), h = Math.ceil(cap + 2 * desc + 2 * S + 8);
+  const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+  const cx = cv.getContext("2d", { willReadFrequently: true });
+  cx.font = font; cx.fillStyle = "#fff"; cx.textBaseline = "alphabetic"; cx.textAlign = "left";
+  let x = (w - textW) / 2;
+  const base = h / 2 + cap / 2;                 // texture centre = middle of the cap height
+  chars.forEach((c, i) => { cx.fillText(c, x, base); x += advs[i] + track; });
+  Object.assign(labelTex, { w, h, capPx: cap, data: sdfField(cx, w, h, S) });
+}
+function uploadLabel(){
+  if (!labelTex.data) return;
+  if (!labelTex.tex) labelTex.tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, labelTex.tex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, labelTex.w, labelTex.h, 0, gl.RED, gl.FLOAT, labelTex.data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.uniform1i(U.uLabel, 1);
+  gl.uniform2f(U.uLabelSize, labelTex.w, labelTex.h);
+  gl.uniform1f(U.uLabelSpread, labelTex.spread);
+  gl.uniform1f(U.uLabelOn, 1);
+  dirty = true;
+}
+function uploadAtlas(){
+  if (!atlas.tex) atlas.tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, atlas.tex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, atlas.w, atlas.h, 0, gl.RED, gl.FLOAT, atlas.data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.uniform1i(U.uAtlas, 0);
+  gl.uniform2f(U.uAtlasSize, atlas.w, atlas.h);
+  gl.uniform2f(U.uCell, atlas.cellW, atlas.cellH);
+  gl.uniform1f(U.uCols, atlas.cols);
+  gl.uniform1f(U.uSpread, atlas.spread);
+}
+
+/* ---- layout (CSS px → scene units) -------------------------------- */
+const lay = {};
+function layout(){
+  const C = CONFIG, Lc = C.layout, lens = C.lens;
+  lay.W = window.innerWidth; lay.H = window.innerHeight;
+  lay.dpr = Math.min(window.devicePixelRatio || 1, C.maxDPR);
+  const groupH = Lc.labelCap + Lc.labelGap + Lc.numberCap + Lc.numberGap + lens.height;
+  let lensW = Math.min(Lc.lensMaxPx, Math.max(Lc.lensMinPx, lay.W * Lc.lensOfViewportWidth));
+  let unit = lensW / lens.width;
+  unit = Math.min(unit, lay.H * Lc.fitHeight / groupH);
+  lay.unit = unit;
+  lay.Wu = lay.W / unit; lay.Hu = lay.H / unit;
+  lay.r = C.track.height / 2;
+  const outerL = lens.width / 2 + Lc.sidePad, outerR = lay.Wu - lens.width / 2 - Lc.sidePad;
+  lay.xL = outerL + lay.r; lay.xR = Math.max(lay.xL, outerR - lay.r);
+  lay.x0 = lay.xL - lay.r; lay.travel = (lay.xR + lay.r) - lay.x0;   // value 0 → x0, value 1 → x0 + travel
+  const labelTop = (lay.Hu - groupH) / 2 - Lc.lift;
+  const top = labelTop + Lc.labelCap + Lc.labelGap;
+  lay.textY = top + Lc.numberCap / 2;
+  lay.lensY = top + Lc.numberCap + Lc.numberGap + lens.height / 2;
+  lay.labelY = labelTop + Lc.labelCap / 2;
+  lay.labelScale = Lc.labelCap / labelTex.capPx;      // units per label texel
+  lay.trackY = lay.lensY + C.track.yOffset;
+  lay.cx = lay.Wu / 2;
+  lay.textScale = Lc.numberCap / atlas.capPx;
+  lay.adv = atlas.digitAdv * lay.textScale * C.number.tracking;
+  lay.pctAdv = atlas.pctAdv * lay.textScale;
+  lay.pctGap = lay.adv * C.number.percentGap;
+  canvas.width  = Math.round(lay.W * lay.dpr);
+  canvas.height = Math.round(lay.H * lay.dpr);
+  snapSlots();
+  dirty = true;
+}
+const xOf = v => lay.x0 + v * lay.travel;
+
+
+
+/* ---- state -------------------------------------------------------- */
+const clamp01 = v => Math.min(1, Math.max(0, v));
+const st = {
+  value: CONFIG.value.initial,
+  fill:    { x: CONFIG.value.initial, v: 0 },
+  lens:    { x: CONFIG.value.initial, v: 0 },
+  stretch: { x: 0, v: 0 },
+  slosh:   { x: 0, v: 0 },     // tilt of the liquid surface in the label
+  wave:    0                   // ripple amplitude, decays when still
+};
+let dirty = true, focusVisible = false;
+const reduceMQ = window.matchMedia("(prefers-reduced-motion: reduce)");
+let reduced = reduceMQ.matches;
+reduceMQ.addEventListener?.("change", e => { reduced = e.matches; auto.phase = "hold"; auto.t = 0; dirty = true; });
+
+function springStep(s, target, freq, zeta, dt){
+  const w = 2 * Math.PI * freq;
+  s.v += (-w * w * (s.x - target) - 2 * zeta * w * s.v) * dt;
+  s.x += s.v * dt;
+}
+
+/* ---- number slots: hundreds, tens, ones, "%" ----------------------- */
+const slots = [0, 1, 2, 3].map(() => ({ from: -1, to: -1, k: 1, x: 0, v: 0 }));
+function slotTargets(val){
+  const s = String(val), n = s.length, glyphs = [-1, -1, -1, 10];
+  for (let i = 0; i < n; i++) glyphs[3 - n + i] = +s[i];
+  const total = n * lay.adv + lay.pctGap + lay.pctAdv, x0 = lay.cx - total / 2, xs = [];
+  for (let i = 0; i < 3; i++) xs[i] = x0 + (i - (3 - n)) * lay.adv + lay.adv / 2;
+  xs[3] = x0 + n * lay.adv + lay.pctGap + lay.pctAdv / 2;
+  return { glyphs, xs };
+}
+const shownValue = () => Math.round(clamp01(st.fill.x) * 100);
+function snapSlots(){
+  const { glyphs, xs } = slotTargets(shownValue());
+  slots.forEach((s, i) => { s.from = s.to = glyphs[i]; s.k = 1; s.x = xs[i]; s.v = 0; });
+}
+function updateSlots(dt){
+  const { glyphs, xs } = slotTargets(shownValue());
+  const P = CONFIG.spring.digits;
+  let active = false;
+  slots.forEach((s, i) => {
+    if (glyphs[i] !== s.to) {
+      if (s.k >= 0.5) { s.from = s.to; s.k = 0; }
+      s.to = glyphs[i];
+      if (reduced) s.k = 1;
+    }
+    if (s.k < 1) { s.k = Math.min(1, s.k + dt / CONFIG.number.morph); active = true; }
+    // sub-step: a frame hitch must never make the spring unstable
+    const n = Math.max(1, Math.ceil(dt / (1 / 240))), h = dt / n;
+    for (let j = 0; j < n; j++) springStep(s, xs[i], P.freq, P.damping, h);
+    if (Math.abs(s.v) > 1e-4 || Math.abs(s.x - xs[i]) > 1e-4) active = true;
+  });
+  return active;
+}
+
+/* ---- autoplay ----------------------------------------------------- */
+const auto = { phase: "hold", t: 0, from: 0, to: 0, dur: 1 };
+let resumeAt = 0, interacting = false;
+const ease = k => k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+function pauseAutoplay(){ resumeAt = Infinity; }
+function scheduleResume(){
+  resumeAt = performance.now() / 1000 + CONFIG.autoplay.resumeDelay;
+  auto.phase = "hold"; auto.t = CONFIG.autoplay.hold;
+}
+function updateAutoplay(now, dt){
+  const A = CONFIG.autoplay;
+  if (!A.enabled || reduced || interacting || now < resumeAt) return false;
+  auto.t += dt;
+  if (auto.phase === "hold") {
+    if (auto.t >= A.hold) {
+      auto.phase = "move"; auto.t = 0; auto.from = st.value;
+      auto.to = Math.abs(st.value - A.max) > Math.abs(st.value - A.min) ? A.max : A.min;
+      auto.dur = A.move * Math.min(1, Math.max(0.5, Math.abs(auto.to - auto.from) / (A.max - A.min)));
+    }
+    return false;
+  }
+  const k = Math.min(auto.t / auto.dur, 1);
+  setValue(auto.from + (auto.to - auto.from) * ease(k));
+  if (k >= 1) { auto.phase = "hold"; auto.t = 0; }
+  return true;
+}
+
+/* ---- value + ARIA ------------------------------------------------- */
+let lastAria = -1;
+function setValue(v){
+  st.value = clamp01(v);
+  const pct = Math.round(st.value * 100);
+  if (pct !== lastAria) {
+    lastAria = pct;
+    sliderEl.setAttribute("aria-valuenow", pct);
+    sliderEl.setAttribute("aria-valuetext", pct + " %");
+  }
+  dirty = true;
+}
+
+/* ---- physics ------------------------------------------------------ */
+function physics(dt){
+  const P = CONFIG.spring, motion = !reduced;
+  const steps = Math.max(1, Math.ceil(dt / (1 / 240))), h = dt / steps;
+  for (let i = 0; i < steps; i++) {
+    springStep(st.fill, st.value, P.fill.freq, P.fill.damping, h);
+    springStep(st.lens, st.value, P.lens.freq, motion ? P.lens.damping : 1.0, h);
+    const sT = motion ? Math.min(CONFIG.stretch.max, Math.abs(st.lens.v * lay.travel) * CONFIG.stretch.gain) : 0;
+    springStep(st.stretch, sT, P.stretch.freq, P.stretch.damping, h);
+  }
+  // liquid in the label lags behind the slider and sloshes back
+  const SL = CONFIG.label.slosh;
+  for (let i = 0; i < steps; i++) {
+    const t = motion ? Math.max(-SL.max, Math.min(SL.max, st.fill.v * SL.gain)) : 0;
+    springStep(st.slosh, t, SL.freq, motion ? SL.damping : 1.0, h);
+  }
+  const agitation = motion ? Math.min(1, Math.abs(st.fill.v) * 1.5 + Math.abs(st.slosh.v) * 4) : 0;
+  st.wave = Math.max(agitation, st.wave * Math.exp(-dt / 0.9));
+  if (st.wave < 0.002) st.wave = 0;
+  return Math.abs(st.fill.v) + Math.abs(st.lens.v) + Math.abs(st.stretch.v) + Math.abs(st.slosh.v) > 1e-4 ||
+         Math.abs(st.fill.x - st.value) + Math.abs(st.lens.x - st.value) + Math.abs(st.stretch.x) + Math.abs(st.slosh.x) > 1e-4 ||
+         st.wave > 0;
+}
+function lensHalf(){
+  const L = CONFIG.lens, m = CONFIG.stretch.max;
+  const s = Math.max(-m, Math.min(m * 1.25, st.stretch.x));
+  return [L.width / 2 * (1 + s), L.height / 2 * (1 - 0.6 * s)];
+}
+
+/* ---- render ------------------------------------------------------- */
+const slotBuf = new Float32Array(16);
+function draw(){
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  const [hx, hy] = lensHalf();
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(U.uUnit, lay.unit * lay.dpr);
+  gl.uniform2f(U.uView, lay.Wu, lay.Hu);
+  gl.uniform3f(U.uTrackGeo, lay.xL, lay.xR, lay.trackY);
+  gl.uniform1f(U.uFill, xOf(clamp01(st.fill.x)));
+  gl.uniform2f(U.uLensC, xOf(st.lens.x), lay.lensY);
+  gl.uniform2f(U.uLensHalf, hx, hy);
+  gl.uniform1f(U.uTextScale, lay.textScale);
+  gl.uniform1f(U.uTextY, lay.textY);
+  slots.forEach((s, i) => {
+    const k = s.k * s.k * (3 - 2 * s.k);
+    slotBuf.set([s.from, s.to, k, s.x], i * 4);
+  });
+  gl.uniform4fv(U["uSlot[0]"], slotBuf);
+  // label liquid level follows the fill
+  const B = CONFIG.label, cap = CONFIG.layout.labelCap, lv = clamp01(st.fill.x);
+  const bottom = lay.labelY + cap / 2 + B.margin * cap, topY = lay.labelY - cap / 2 - B.margin * cap;
+  const edge = Math.min(1, lv / 0.06, (1 - lv) / 0.06);          // keep 0 % and 100 % perfectly still
+  gl.uniform2f(U.uLabelC, lay.cx, lay.labelY);
+  gl.uniform1f(U.uLabelScale, lay.labelScale);
+  gl.uniform1f(U.uLevelY, bottom + (topY - bottom) * lv);
+  gl.uniform1f(U.uLevelTilt, st.slosh.x * edge);
+  gl.uniform1f(U.uWaveAmp, B.wave.amp * cap * st.wave * edge);
+  gl.uniform1f(U.uWaveK, B.wave.k);
+  gl.uniform1f(U.uWaveW, B.wave.speed);
+  gl.uniform1f(U.uTime, (performance.now() / 1000) % 1000);
+  gl.uniform1f(U.uFocus, focusVisible ? 1 : 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+let last = performance.now(), glReady = false;
+function frame(nowMs){
+  const dt = Math.min(0.05, Math.max(0, (nowMs - last) / 1000)); last = nowMs;
+  const a = updateAutoplay(nowMs / 1000, dt);
+  const m = physics(dt);
+  const s = updateSlots(dt);
+  if (glReady && (dirty || a || m || s)) { draw(); dirty = false; }
+  requestAnimationFrame(frame);
+}
+
+/* ---- interaction -------------------------------------------------- */
+const toUnits = (cx, cy) => [cx / lay.unit, cy / lay.unit];
+const valueAt = x => (x - lay.x0) / lay.travel;
+function hitLens(x, y){
+  const [a, b] = lensHalf(), n = CONFIG.lens.exponent;
+  return Math.pow(Math.abs(x - xOf(st.lens.x)) / a, n) + Math.pow(Math.abs(y - lay.lensY) / b, n) <= 1;
+}
+function hitTrack(x, y){
+  return Math.abs(y - lay.trackY) <= CONFIG.track.height * 0.9 &&
+         x >= lay.x0 - 0.08 && x <= lay.x0 + lay.travel + 0.08;
+}
+
+let grab = 0, pointerId = null;
+sliderEl.addEventListener("pointerdown", e => {
+  const [x, y] = toUnits(e.clientX, e.clientY);
+  const onLens = hitLens(x, y);
+  if (!onLens && !hitTrack(x, y)) return;
+  e.preventDefault();
+  sliderEl.focus({ preventScroll: true });
+  focusVisible = false;
+  pointerId = e.pointerId; sliderEl.setPointerCapture(pointerId);
+  interacting = true; pauseAutoplay();
+  sliderEl.classList.add("dragging");
+  grab = onLens ? st.value - valueAt(x) : 0;
+  setValue(valueAt(x) + grab);
+});
+sliderEl.addEventListener("pointermove", e => {
+  const [x, y] = toUnits(e.clientX, e.clientY);
+  if (e.pointerId === pointerId) { setValue(valueAt(x) + grab); return; }
+  sliderEl.classList.toggle("grab", hitLens(x, y) || hitTrack(x, y));
+});
+function endDrag(e){
+  if (e.pointerId !== pointerId) return;
+  pointerId = null; interacting = false;
+  sliderEl.classList.remove("dragging");
+  if (!focusVisible) scheduleResume();
+}
+sliderEl.addEventListener("pointerup", endDrag);
+sliderEl.addEventListener("pointercancel", endDrag);
+
+sliderEl.addEventListener("keydown", e => {
+  const V = CONFIG.value; let v = st.value;
+  switch (e.key) {
+    case "ArrowRight": case "ArrowUp":   v += e.shiftKey ? V.pageStep : V.step; break;
+    case "ArrowLeft":  case "ArrowDown": v -= e.shiftKey ? V.pageStep : V.step; break;
+    case "PageUp":   v += V.pageStep; break;
+    case "PageDown": v -= V.pageStep; break;
+    case "Home": v = 0; break;
+    case "End":  v = 1; break;
+    default: return;
+  }
+  e.preventDefault();
+  focusVisible = true; pauseAutoplay();
+  setValue(Math.round(v / V.step) * V.step);
+});
+sliderEl.addEventListener("focus", () => {
+  if (sliderEl.matches(":focus-visible")) { focusVisible = true; pauseAutoplay(); dirty = true; }
+});
+sliderEl.addEventListener("blur", () => { focusVisible = false; dirty = true; if (!interacting) scheduleResume(); });
+
+/* ---- boot --------------------------------------------------------- */
+window.addEventListener("resize", layout);
+if (window.ResizeObserver) new ResizeObserver(layout).observe(document.documentElement);
+canvas.addEventListener("webglcontextlost", e => { e.preventDefault(); glReady = false; });
+canvas.addEventListener("webglcontextrestored", () => { initGL(); glReady = true; dirty = true; });
+
+buildAtlas(); buildLabel();
+layout();
+setValue(CONFIG.value.initial);
+if (gl) {
+  try { initGL(); glReady = true; } catch (err) { console.error(err); }
+}
+// Rebuild the digit atlas once the rounded webfont has arrived.
+if (document.fonts && document.fonts.load) {
+  document.fonts.load(`${CONFIG.number.weight} ${CONFIG.number.atlasFontPx}px Fredoka`, "0123456789%" + CONFIG.label.text)
+    .then(faces => {
+      if (!faces.length) return;
+      buildAtlas(); buildLabel(); layout();
+      if (glReady) { uploadAtlas(); uploadLabel(); }
+    }).catch(() => {});
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
